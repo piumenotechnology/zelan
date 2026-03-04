@@ -1,7 +1,5 @@
 const { pool } = require('../config/database');
-const path = require('path');
-const fs = require('fs');
-const compressImage = require('../utils/compressImage');
+const { cloudinary } = require('../config/upload');
 
 // Helper to create slug
 const createSlug = (text) => {
@@ -11,13 +9,19 @@ const createSlug = (text) => {
         .replace(/(^-|-$)/g, '');
 };
 
-// Helper to delete file
-const deleteFile = (filePath) => {
-    if (filePath) {
-        const fullPath = path.join(__dirname, '..', filePath);
-        if (fs.existsSync(fullPath)) {
-            fs.unlinkSync(fullPath);
-        }
+// Helper to delete a file from Cloudinary by its URL
+const deleteCloudinaryFile = async (url) => {
+    if (!url || !url.includes('cloudinary.com')) return;
+    const isVideo = url.includes('/video/upload/');
+    const resourceType = isVideo ? 'video' : 'image';
+    const uploadSegment = isVideo ? '/video/upload/' : '/image/upload/';
+    const parts = url.split(uploadSegment);
+    if (parts.length < 2) return;
+    const publicId = parts[1].replace(/^v\d+\//, '').replace(/\.[^/.]+$/, '');
+    try {
+        await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
+    } catch (err) {
+        console.error('Failed to delete from Cloudinary:', err.message);
     }
 };
 
@@ -154,7 +158,7 @@ const createMenuItem = async (req, res) => {
 
         if (req.files) {
             if (req.files.voice_file && req.files.voice_file[0]) {
-                voiceFilePath = `uploads/voice/${req.files.voice_file[0].filename}`;
+                voiceFilePath = req.files.voice_file[0].path;
             }
             // if (req.files.image_file && req.files.image_file[0]) {
             //     imageFilePath = `uploads/images/${req.files.image_file[0].filename}`;
@@ -314,12 +318,12 @@ const updateMenuItem = async (req, res) => {
         // Handle VOICE file - only update if new file uploaded or explicitly removed
         if (req.files && req.files.voice_file && req.files.voice_file[0]) {
             // New voice file uploaded - delete old one and use new
-            deleteFile(current.voice_file);
+            await deleteCloudinaryFile(current.voice_file);
             updates.push('voice_file = ?');
-            values.push(`uploads/voice/${req.files.voice_file[0].filename}`);
+            values.push(req.files.voice_file[0].path);
         } else if (remove_voice_file === 'true') {
             // Explicitly requested to remove voice file
-            deleteFile(current.voice_file);
+            await deleteCloudinaryFile(current.voice_file);
             updates.push('voice_file = ?');
             values.push(null);
         }
@@ -328,9 +332,7 @@ const updateMenuItem = async (req, res) => {
         // Handle IMAGE file - insert into menu_images table
         let newImagePath = null;
         if (req.files && req.files.image_file && req.files.image_file[0]) {
-            newImagePath = `uploads/images/${req.files.image_file[0].filename}`;
-            // Compress image before saving to DB
-            await compressImage(newImagePath);
+            newImagePath = req.files.image_file[0].path;
         } else if (image_url !== undefined && image_url !== '') {
             newImagePath = image_url;
         }
@@ -438,7 +440,7 @@ const deleteMenuItem = async (req, res) => {
         }
         
         // Delete voice file
-        deleteFile(item[0].voice_file);
+        await deleteCloudinaryFile(item[0].voice_file);
 
         // Delete associated images from menu_images
         const [images] = await pool.query(
@@ -446,9 +448,7 @@ const deleteMenuItem = async (req, res) => {
             [id]
         );
         for (const img of images) {
-            if (img.image_url && img.image_url.startsWith('uploads/')) {
-                deleteFile(img.image_url);
-            }
+            await deleteCloudinaryFile(img.image_url);
         }
 
         // Delete images from database (will also be deleted via CASCADE if set up)
@@ -496,18 +496,18 @@ const uploadVoiceFile = async (req, res) => {
         
         if (currentItem.length === 0) {
             // Delete uploaded file
-            deleteFile(`uploads/voice/${req.file.filename}`);
+            await deleteCloudinaryFile(req.file.path);
             return res.status(404).json({
                 success: false,
                 message: 'Menu item not found'
             });
         }
-        
+
         // Delete old voice file
-        deleteFile(currentItem[0].voice_file);
-        
+        await deleteCloudinaryFile(currentItem[0].voice_file);
+
         // Update with new voice file
-        const voiceFilePath = `uploads/voice/${req.file.filename}`;
+        const voiceFilePath = req.file.path;
         await pool.query(
             `UPDATE menu_items SET voice_file = ? WHERE id = ?`,
             [voiceFilePath, id]
@@ -590,7 +590,7 @@ const uploadMenuImage = async (req, res) => {
         );
 
         if (menuItem.length === 0) {
-            deleteFile(`uploads/images/${req.file.filename}`);
+            await deleteCloudinaryFile(req.file.path);
             return res.status(404).json({
                 success: false,
                 message: 'Menu item not found'
@@ -604,7 +604,7 @@ const uploadMenuImage = async (req, res) => {
         );
 
         if (imageCount[0].count >= 4) {
-            deleteFile(`uploads/images/${req.file.filename}`);
+            await deleteCloudinaryFile(req.file.path);
             return res.status(400).json({
                 success: false,
                 message: 'Maximum of 4 images allowed per menu item'
@@ -620,10 +620,7 @@ const uploadMenuImage = async (req, res) => {
             [id]
         );
 
-        const imageUrl = `uploads/images/${req.file.filename}`;
-
-        // Compress image before saving to DB
-        await compressImage(imageUrl);
+        const imageUrl = req.file.path;
 
         const [result] = await pool.query(
             `INSERT INTO menu_images (menu_id, image_url, is_main, sort_order) VALUES (?, ?, ?, ?)`,
@@ -679,7 +676,7 @@ const deleteMenuImage = async (req, res) => {
         const wasMain = image[0].is_main;
 
         // Delete the file
-        deleteFile(image[0].image_url);
+        await deleteCloudinaryFile(image[0].image_url);
 
         // Delete from database
         await pool.query(
